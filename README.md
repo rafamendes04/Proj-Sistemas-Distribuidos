@@ -20,18 +20,6 @@ O broker unifica, despacha as requisições (Load Balancing) e reencaminha a res
 2. **SQLite embarcado em Python**: Garantindo a persistência estipulada em requisitos, foi desenvolvido um banco de dados relacional leve (SQLite) armazenado em arquivo físico na camada dos servidores Python, separados por volumes Docker e garantindo o seu próprio disco por instância de contêiner. O Sqlite processa inserções, verificação de concorrência local para nomes de canais evitando conflito de forma eficaz.
 3. **Java/JeroMQ para Clientes**: O cliente construído em Java opera independentemente rodando rotinas temporizadas automáticas, o módulo JeroMQ proporciona a exata mesma implementação C++ em formato Pure-Java descartando complexas bibliotecas nativas C++. Jackson com `jackson-dataformat-msgpack` é usado para conversão direta das mensagens binárias.
 
-## Instruções de Execução
-
-Como foi exigido automação máxima utilizando `docker compose up`, rodar todo o sistema e visualizar seu fluxo natural demora poucos segundos:
-
-1. Assegure que não existe nada em sua máquina segurando as portas `5555`/`5556`. (Ou acesse-as rodando com Docker Engine).
-2. Abra o terminal raiz do projeto (`/Proj Sistemas Distribuidos`)
-3. Execute o comando principal de construção de imagens e orquestração dos contêineres:
-
-```bash
-docker compose up --build
-```
-
 ### O que irá acontecer em tela:
 
 1. O Docker vai empacotar as dependências do servidor (Python pip + dependência `msgpack`) garantindo um processamento limpo e rápido.
@@ -40,5 +28,3 @@ docker compose up --build
 4. Consecutivamente, `client-1` (Alice) e `client-2` (Bob) darão *"Attempting login"* no painel REQ.
 5. Em loop os Bots farão: Request *Login* ➔ Request *Channels List* ➔ Request *Create personal bot_channel* ➔ *Delay...* Request *Channels Update Infinity Loop*.
 6. Todas as respostas provém da camada de Servidores com identificadores indicando qual Nó Servidor atendeu aquele Load Balancing.
-
-> **💡 Note**: As bases de login e de dados são independentes. Logo o primeiro Bot que for direcionado para `server_1` será resguardado por uma tabela separada em disco em `/app/data/server_1.db`. Se o Bot cair e enviar nova requisição para o broker e a flag de RoundRobin mandá-lo para `server_2`, internamente o ZeroMQ/DB vai recriar esse registro em `/app/data/server_2.db`. Fator imprescindível na topologia desenhada e pronto para extensão futura de P2P ou Distributed Hashes em próximos trabalhos.

@@ -3,13 +3,11 @@ package com.chat.client;
 import org.zeromq.SocketType;
 import org.zeromq.ZContext;
 import org.zeromq.ZMQ;
-import com.chat.proto.ChatProto.Wrapper;
-import com.chat.proto.ChatProto.LoginRequest;
-import com.chat.proto.ChatProto.CreateChannelRequest;
-import com.chat.proto.ChatProto.ListChannelsRequest;
-import com.chat.proto.ChatProto.MessageType;
-import com.chat.proto.ChatProto.Status;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.msgpack.jackson.dataformat.MessagePackFactory;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.UUID;
 
 public class BotClient {
@@ -23,125 +21,146 @@ public class BotClient {
 
         System.out.println("🤖 [" + botName + "] Iniciando. Conectando ao broker em " + brokerUrl);
 
+        ObjectMapper objectMapper = new ObjectMapper(new MessagePackFactory());
+
         try (ZContext context = new ZContext()) {
-            // Padrão REQ para criar pacotes RPC para o servidor -> Aguarda obrigatoriamente um REP
             ZMQ.Socket socket = context.createSocket(SocketType.REQ);
-            socket.setReceiveTimeOut(5000); // Timeout de 5s para não travar a thread infinitamente
+            socket.setReceiveTimeOut(5000);
             socket.connect(brokerUrl);
 
-            // 1. Loop contínuo tentando Logar no bot server
             boolean loggedIn = false;
             while (!loggedIn) {
                 System.out.println("🤖 [" + botName + "] Tentando realizar login...");
-                Wrapper loginReq = Wrapper.newBuilder()
-                    .setType(MessageType.LOGIN_REQ)
-                    .setTimestamp(System.currentTimeMillis())
-                    .setLoginReq(LoginRequest.newBuilder().setUsername(botName).build())
-                    .build();
+                
+                Map<String, Object> loginReq = new HashMap<>();
+                loginReq.put("type", "LOGIN_REQ");
+                loginReq.put("timestamp", System.currentTimeMillis());
+                
+                Map<String, Object> payload = new HashMap<>();
+                payload.put("username", botName);
+                loginReq.put("payload", payload);
 
-                // Transforma as instâncias da classe gerada pelo Protobuf em bytes para viajar no ZeroMQ
-                socket.send(loginReq.toByteArray(), 0);
-                
-                byte[] reply = socket.recv(0);
-                if (reply == null) {
-                    System.out.println("⚠️ [" + botName + "] Tempo esgotado aguardando resposta do login. Retentando...");
-                    // Ao dar timeout, o padrão REQ/REP oficial exige recrear ou fechar o socket pra manter a consistência da FSM Interna
-                    socket.close();
-                    socket = context.createSocket(SocketType.REQ);
-                    socket.setReceiveTimeOut(5000);
-                    socket.connect(brokerUrl);
-                    Thread.sleep(2000);
-                    continue; // Repete até conseguir login
-                }
-                
                 try {
-                    Wrapper resp = Wrapper.parseFrom(reply);
-                    if (resp.getType() == MessageType.LOGIN_RESP) {
-                        if (resp.getLoginResp().getStatus() == Status.SUCCESS) {
-                            System.out.println("✅ [" + botName + "] Login bem sucedido! Msg: " + resp.getLoginResp().getMessage());
+                    System.out.println("🤖 [" + botName + "] --> Enviando Login | Conteúdo Completo: " + loginReq);
+                    socket.send(objectMapper.writeValueAsBytes(loginReq), 0);
+                    
+                    byte[] reply = socket.recv(0);
+                    if (reply == null) {
+                        System.out.println("⚠️ [" + botName + "] Tempo esgotado aguardando resposta do login. Retentando...");
+                        socket.close();
+                        socket = context.createSocket(SocketType.REQ);
+                        socket.setReceiveTimeOut(5000);
+                        socket.connect(brokerUrl);
+                        Thread.sleep(2000);
+                        continue;
+                    }
+
+                    Map<String, Object> resp = objectMapper.readValue(reply, Map.class);
+                    System.out.println("🤖 [" + botName + "] <-- Resposta de Login Recebida | Conteúdo Completo: " + resp);
+
+                    if ("LOGIN_RESP".equals(resp.get("type"))) {
+                        Map<String, Object> respPayload = (Map<String, Object>) resp.get("payload");
+                        if ("SUCCESS".equals(respPayload.get("status"))) {
+                            System.out.println("✅ [" + botName + "] Login bem sucedido! Msg: " + respPayload.get("message"));
                             loggedIn = true;
                         } else {
-                            System.out.println("❌ [" + botName + "] Falha no login: " + resp.getLoginResp().getMessage());
+                            System.out.println("❌ [" + botName + "] Falha no login: " + respPayload.get("message"));
                             Thread.sleep(2000);
                         }
-                    } else {
-                        System.out.println("⚠️ [" + botName + "] Tipo de resposta inesperada recebida: " + resp.getType());
                     }
                 } catch (Exception e) {
-                    System.err.println("❌ [" + botName + "] Erro interpretando payload protobuf: " + e.getMessage());
+                    System.err.println("❌ [" + botName + "] Erro: " + e.getMessage());
                 }
             }
 
-            // 2. Após logar, requisita quais canais estão disponíveis
             System.out.println("📄 [" + botName + "] Solicitando listagem de canais...");
-            Wrapper listReq = Wrapper.newBuilder()
-                .setType(MessageType.LIST_CHANNELS_REQ)
-                .setTimestamp(System.currentTimeMillis())
-                .setListChannelsReq(ListChannelsRequest.newBuilder().build())
-                .build();
-            
-            socket.send(listReq.toByteArray(), 0);
-            byte[] listReplyRaw = socket.recv(0);
-            if (listReplyRaw != null) {
-                try {
-                    Wrapper resp = Wrapper.parseFrom(listReplyRaw);
-                    if (resp.getType() == MessageType.LIST_CHANNELS_RESP && resp.getListChannelsResp().getStatus() == Status.SUCCESS) {
-                        System.out.println("📚 [" + botName + "] Canais atualmente disponíveis: " + resp.getListChannelsResp().getChannelsList());
-                    }
-                } catch (Exception e) {
-                    System.err.println("❌ [" + botName + "] Erro lendo listagem de canais: " + e.getMessage());
-                }
-            }
+            try {
+                Map<String, Object> listReq = new HashMap<>();
+                listReq.put("type", "LIST_CHANNELS_REQ");
+                listReq.put("timestamp", System.currentTimeMillis());
+                listReq.put("payload", new HashMap<>());
 
-            // 3. Em seguida, cria o próprio canal do bot garantindo que o nome do canal seja único e exlusivo para ele
-            String myChannel = "channel_" + botName;
-            System.out.println("➕ [" + botName + "] Requisição para criação do novo canal: " + myChannel);
-            Wrapper createReq = Wrapper.newBuilder()
-                .setType(MessageType.CREATE_CHANNEL_REQ)
-                .setTimestamp(System.currentTimeMillis())
-                .setCreateChannelReq(CreateChannelRequest.newBuilder().setChannelName(myChannel).build())
-                .build();
-            
-            socket.send(createReq.toByteArray(), 0);
-            byte[] createReplyRaw = socket.recv(0);
-            if (createReplyRaw != null) {
-                try {
-                    Wrapper resp = Wrapper.parseFrom(createReplyRaw);
-                    if (resp.getType() == MessageType.CREATE_CHANNEL_RESP) {
-                        if (resp.getCreateChannelResp().getStatus() == Status.SUCCESS) {
-                            System.out.println("✅ [" + botName + "] Sucesso criando canal: " + resp.getCreateChannelResp().getMessage());
-                        } else {
-                            System.out.println("❌ [" + botName + "] Server negou criar o canal: " + resp.getCreateChannelResp().getMessage());
+                System.out.println("📄 [" + botName + "] --> Enviando Listagem | Conteúdo Completo: " + listReq);
+                socket.send(objectMapper.writeValueAsBytes(listReq), 0);
+                
+                byte[] listReplyRaw = socket.recv(0);
+                if (listReplyRaw != null) {
+                    Map<String, Object> resp = objectMapper.readValue(listReplyRaw, Map.class);
+                    System.out.println("📄 [" + botName + "] <-- Resposta Listagem Recebida | Conteúdo Completo: " + resp);
+                    
+                    if ("LIST_CHANNELS_RESP".equals(resp.get("type"))) {
+                        Map<String, Object> p = (Map<String, Object>) resp.get("payload");
+                        if ("SUCCESS".equals(p.get("status"))) {
+                            System.out.println("📚 [" + botName + "] Canais atualmente disponíveis: " + p.get("channels"));
                         }
                     }
-                } catch (Exception e) {
-                    System.err.println("❌ [" + botName + "] Retorno inesperado na criação: " + e.getMessage());
                 }
+            } catch (Exception e) {
+                System.err.println("❌ [" + botName + "] Erro: " + e.getMessage());
             }
-            
-            // 4. Manter bot "vivo" solicitando atualizações infinitamente
+
+            String myChannel = "channel_" + botName;
+            System.out.println("➕ [" + botName + "] Requisição para criação do novo canal: " + myChannel);
+            try {
+                Map<String, Object> createReq = new HashMap<>();
+                createReq.put("type", "CREATE_CHANNEL_REQ");
+                createReq.put("timestamp", System.currentTimeMillis());
+                Map<String, Object> payloadCreate = new HashMap<>();
+                payloadCreate.put("channel_name", myChannel);
+                createReq.put("payload", payloadCreate);
+
+                System.out.println("➕ [" + botName + "] --> Enviando Criação | Conteúdo Completo: " + createReq);
+                socket.send(objectMapper.writeValueAsBytes(createReq), 0);
+                
+                byte[] createReplyRaw = socket.recv(0);
+                if (createReplyRaw != null) {
+                    Map<String, Object> resp = objectMapper.readValue(createReplyRaw, Map.class);
+                    System.out.println("➕ [" + botName + "] <-- Resposta Criação Recebida | Conteúdo Completo: " + resp);
+
+                    if ("CREATE_CHANNEL_RESP".equals(resp.get("type"))) {
+                        Map<String, Object> p = (Map<String, Object>) resp.get("payload");
+                        if ("SUCCESS".equals(p.get("status"))) {
+                            System.out.println("✅ [" + botName + "] Sucesso criando canal: " + p.get("message"));
+                        } else {
+                            System.out.println("❌ [" + botName + "] Server negou criar o canal: " + p.get("message"));
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                System.err.println("❌ [" + botName + "] Erro: " + e.getMessage());
+            }
+
+            // Manter bot "vivo" solicitando atualizações infinitamente
             while(true) {
                 Thread.sleep(8000); // Pausa 8s
                 System.out.println("🔍 [" + botName + "] (Rotina) Listando updates dos canais...");
                 
-                // Re-enviar a mesma requisição imutável já instanciada listReq
-                
-                // Timeout sanity check before reuse in REQ
-                socket.send(listReq.toByteArray(), 0);
-                byte[] periodicReply = socket.recv(0);
-                if (periodicReply != null) {
-                    try {
-                        Wrapper resp = Wrapper.parseFrom(periodicReply);
-                        if(resp.getType() == MessageType.LIST_CHANNELS_RESP) {
-                            System.out.println("📚 [" + botName + "] Status dos canais online: " + resp.getListChannelsResp().getChannelsList().toString());
+                try {
+                    Map<String, Object> updateReq = new HashMap<>();
+                    updateReq.put("type", "LIST_CHANNELS_REQ");
+                    updateReq.put("timestamp", System.currentTimeMillis()); // Atualiza o timestamp a cada iteração!
+                    updateReq.put("payload", new HashMap<>());
+
+                    System.out.println("🔍 [" + botName + "] --> Enviando Rotina | Conteúdo Completo: " + updateReq);
+                    socket.send(objectMapper.writeValueAsBytes(updateReq), 0);
+                    
+                    byte[] periodicReply = socket.recv(0);
+                    if (periodicReply != null) {
+                        Map<String, Object> resp = objectMapper.readValue(periodicReply, Map.class);
+                        System.out.println("🔍 [" + botName + "] <-- Update Recebido | Conteúdo Completo: " + resp);
+
+                        if("LIST_CHANNELS_RESP".equals(resp.get("type"))) {
+                            Map<String, Object> p = (Map<String, Object>) resp.get("payload");
+                            System.out.println("📚 [" + botName + "] Status dos canais online: " + p.get("channels"));
                         }
-                    } catch (Exception e) {}
-                } else {
-                    // Timeout handled silently or recover socket
-                    socket.close();
-                    socket = context.createSocket(SocketType.REQ);
-                    socket.setReceiveTimeOut(5000);
-                    socket.connect(brokerUrl);
+                    } else {
+                        socket.close();
+                        socket = context.createSocket(SocketType.REQ);
+                        socket.setReceiveTimeOut(5000);
+                        socket.connect(brokerUrl);
+                    }
+                } catch (Exception e) {
+                    System.err.println("❌ [" + botName + "] Erro no loop de update: " + e.getMessage());
                 }
             }
         }

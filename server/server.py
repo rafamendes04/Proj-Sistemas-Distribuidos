@@ -2,11 +2,7 @@ import zmq
 import time
 import sqlite3
 import os
-import sys
-
-# Adiciona o diretório proto gerado ao path para importar as classes do Protobuf
-sys.path.append(os.path.join(os.path.dirname(__file__), 'proto'))
-import chat_pb2
+import msgpack
 
 def init_db(db_name):
     """
@@ -34,30 +30,30 @@ def handle_login(conn, req):
     timestamp = int(time.time() * 1000)
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT OR IGNORE INTO users (username, timestamp) VALUES (?, ?)", (req.username, timestamp))
+        cursor.execute("INSERT OR IGNORE INTO users (username, timestamp) VALUES (?, ?)", (req['username'], timestamp))
         conn.commit()
-        return chat_pb2.SUCCESS, f"User {req.username} logged in."
+        return "SUCCESS", f"User {req['username']} logged in."
     except Exception as e:
-        return chat_pb2.ERROR, str(e)
+        return "ERROR", str(e)
 
 def handle_create_channel(conn, req):
     timestamp = int(time.time() * 1000)
     cursor = conn.cursor()
     try:
-        cursor.execute("INSERT INTO channels (channel_name, created_at) VALUES (?, ?)", (req.channel_name, timestamp))
+        cursor.execute("INSERT INTO channels (channel_name, created_at) VALUES (?, ?)", (req['channel_name'], timestamp))
         conn.commit()
-        return chat_pb2.SUCCESS, f"Channel '{req.channel_name}' created."
+        return "SUCCESS", f"Channel '{req['channel_name']}' created."
     except sqlite3.IntegrityError:
-        return chat_pb2.ERROR, f"Channel '{req.channel_name}' already exists."
+        return "ERROR", f"Channel '{req['channel_name']}' already exists."
     except Exception as e:
-        return chat_pb2.ERROR, str(e)
+        return "ERROR", str(e)
 
 def handle_list_channels(conn, req):
     cursor = conn.cursor()
     cursor.execute("SELECT channel_name FROM channels")
     rows = cursor.fetchall()
     channels = [row[0] for row in rows]
-    return chat_pb2.SUCCESS, channels, "Channels listed successfully."
+    return "SUCCESS", channels, "Channels listed successfully."
 
 def main():
     server_id = os.getenv('SERVER_ID', 'server_1')
@@ -82,59 +78,43 @@ def main():
         try:
             message = socket.recv()
             
-            # Deserializa a mensagem utilizando Protobuf
-            wrapper = chat_pb2.Wrapper()
-            wrapper.ParseFromString(message)
+            # Deserializa a mensagem utilizando MessagePack
+            wrapper = msgpack.unpackb(message, raw=False)
             
-            try:
-                msg_type_name = chat_pb2.MessageType.Name(wrapper.type)
-            except ValueError:
-                msg_type_name = "UNKNOWN"
+            msg_type_name = wrapper.get('type', 'UNKNOWN')
                 
-            print(f"[{server_id}] <-- Requisição recebida: {msg_type_name}")
+            print(f"[{server_id}] <-- Requisição recebida: {msg_type_name} | Conteúdo Completo: {wrapper}")
             
             # Prepara a estrutura da resposta
-            response = chat_pb2.Wrapper()
-            response.timestamp = int(time.time() * 1000)
+            response = {}
+            response["timestamp"] = int(time.time() * 1000)
             
             # Processa de acordo com o tipo da mensagem
-            if wrapper.type == chat_pb2.LOGIN_REQ:
-                status, msg = handle_login(conn, wrapper.login_req)
-                response.type = chat_pb2.LOGIN_RESP
-                response.login_resp.status = status
-                response.login_resp.message = msg
+            if msg_type_name == "LOGIN_REQ":
+                status, msg = handle_login(conn, wrapper.get('payload', {}))
+                response["type"] = "LOGIN_RESP"
+                response["payload"] = {"status": status, "message": msg}
                 
-            elif wrapper.type == chat_pb2.CREATE_CHANNEL_REQ:
-                status, msg = handle_create_channel(conn, wrapper.create_channel_req)
-                response.type = chat_pb2.CREATE_CHANNEL_RESP
-                response.create_channel_resp.status = status
-                response.create_channel_resp.message = msg
+            elif msg_type_name == "CREATE_CHANNEL_REQ":
+                status, msg = handle_create_channel(conn, wrapper.get('payload', {}))
+                response["type"] = "CREATE_CHANNEL_RESP"
+                response["payload"] = {"status": status, "message": msg}
                 
-            elif wrapper.type == chat_pb2.LIST_CHANNELS_REQ:
-                status, channels, msg = handle_list_channels(conn, wrapper.list_channels_req)
-                response.type = chat_pb2.LIST_CHANNELS_RESP
-                response.list_channels_resp.status = status
-                response.list_channels_resp.message = msg
-                response.list_channels_resp.channels.extend(channels)
+            elif msg_type_name == "LIST_CHANNELS_REQ":
+                status, channels, msg = handle_list_channels(conn, wrapper.get('payload', {}))
+                response["type"] = "LIST_CHANNELS_RESP"
+                response["payload"] = {"status": status, "message": msg, "channels": channels}
                 
             else:
-                response.type = chat_pb2.UNKNOWN
+                response["type"] = "UNKNOWN"
             
-            try:
-                resp_type_name = chat_pb2.MessageType.Name(response.type)
-            except ValueError:
-                resp_type_name = "UNKNOWN"
-
-            print(f"[{server_id}] --> Enviando resposta: {resp_type_name}")
+            print(f"[{server_id}] --> Enviando resposta: {response['type']} | Conteúdo Completo: {response}")
             
-            # Serializa a resposta para binário e envia
-            socket.send(response.SerializeToString())
+            # Serializa a resposta para binário com MessagePack e envia
+            socket.send(msgpack.packb(response, use_bin_type=True))
             
         except Exception as e:
             print(f"[{server_id}] ❌ Erro processando a mensagem: {e}")
-            # Em caso de erro muito grave (ex: format exception), 
-            # é importante não deixar o socket ZMQ REQ/REP num estado travado.
-            # Aqui, para fins didáticos, lidamos enviando um UNKNOWN ou reiniciando o socket, mas try/catch geral absorve.
             pass
 
 if __name__ == "__main__":

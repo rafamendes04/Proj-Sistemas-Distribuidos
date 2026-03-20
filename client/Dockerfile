@@ -2,8 +2,7 @@
 FROM maven:3.8.7-eclipse-temurin-11 AS build
 WORKDIR /app
 
-# Necessitamos do diretório proto root onde o arquivo .proto está armazenado
-COPY proto /app/proto
+# Removido cópia ddo proto para o client, usando agora msgpack
 
 # Copia os metadados do projeto pom.xml e código fonte para dentro do container Build
 COPY client/pom.xml /app/client/pom.xml

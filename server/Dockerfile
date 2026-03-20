@@ -11,10 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia código fonte
 COPY server/server.py server/broker.py ./
-COPY proto/chat.proto ./proto/
-
-# Compila o arquivo proto usando o plugin Python
-RUN python -m grpc_tools.protoc -I./proto --python_out=./proto ./proto/chat.proto
+# Compilação do protoc removida pois estamos usando MessagePack
 
 # Permite acesso à porta do broker externamente e internamente para Docker
 EXPOSE 5555 5556

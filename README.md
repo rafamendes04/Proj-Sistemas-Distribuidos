@@ -28,3 +28,28 @@ O broker unifica, despacha as requisições (Load Balancing) e reencaminha a res
 4. Consecutivamente, `client-1` (Alice) e `client-2` (Bob) darão *"Attempting login"* no painel REQ.
 5. Em loop os Bots farão: Request *Login* ➔ Request *Channels List* ➔ Request *Create personal bot_channel* ➔ *Delay...* Request *Channels Update Infinity Loop*.
 6. Todas as respostas provém da camada de Servidores com identificadores indicando qual Nó Servidor atendeu aquele Load Balancing.
+
+### Abordagem ZeroMQ - Pub/Sub (Entrega 2)
+Para a publicação de mensagens nos canais, foi adicionado um **proxy Pub/Sub** separado do broker REQ/REP:
+- O proxy utiliza o padrão **XSUB/XPUB** do ZeroMQ.
+- Os **Servidores** conectam via PUB na porta `5557` (XSUB do proxy) e publicam mensagens usando o nome do canal como tópico.
+- Os **Bots** conectam via SUB na porta `5558` (XPUB do proxy) e se inscrevem nos tópicos de interesse.
+
+Essa separação entre o broker de requisições e o proxy pub/sub mantém os dois fluxos independentes, facilitando a escalabilidade.
+
+## Funcionamento dos Bots (Entrega 2)
+
+Ao iniciar, cada bot segue o fluxo:
+
+1. Faz login no servidor via REQ/REP.
+2. Lista os canais disponíveis.
+3. Se existirem menos de 5 canais, cria um novo canal próprio.
+4. Se inscreve em até 3 canais aleatórios via SUB no proxy Pub/Sub.
+5. Entra em loop infinito:
+   - Lista os canais disponíveis e verifica se precisa se inscrever em mais algum.
+   - Escolhe um canal aleatório.
+   - Envia 10 mensagens aleatórias com intervalo de 1 segundo entre cada uma.
+
+Toda mensagem recebida via Pub/Sub é exibida no terminal com o canal, remetente, timestamp de envio e timestamp de recebimento.
+
+A partir da entrega 2, o servidor também persiste todas as mensagens publicadas nos canais no SQLite, armazenando canal, remetente, conteúdo e timestamp — permitindo recuperação futura do histórico completo.

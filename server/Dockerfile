@@ -10,7 +10,7 @@ COPY server/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia código fonte
-COPY server/server.py server/broker.py ./
+COPY server/server.py server/broker.py server/pubsub_proxy.py ./
 # Compilação do protoc removida pois estamos usando MessagePack
 
 # Permite acesso à porta do broker externamente e internamente para Docker

@@ -1,7 +1,6 @@
 version: '3.8'
 
 services:
-  # O Broker ZeroMQ abstrai a arquitetura multi-node mantendo clientes independentes do número de servidores
   broker:
     build:
       context: .
@@ -13,7 +12,17 @@ services:
       - "5555:5555"
       - "5556:5556"
 
-  # Primeiro nó servidor atuando de forma distribuída, cada nó mantém seu banco via volumes separados
+  pubsub-proxy:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    command: python pubsub_proxy.py
+    networks:
+      - chat-net
+    ports:
+      - "5557:5557"
+      - "5558:5558"
+
   server-1:
     build:
       context: .
@@ -21,15 +30,16 @@ services:
     environment:
       - SERVER_ID=server_1
       - BROKER_URL=tcp://broker:5556
+      - PUBSUB_URL=tcp://pubsub-proxy:5557
     command: python server.py
     volumes:
       - server1-data:/app/data
     depends_on:
       - broker
+      - pubsub-proxy
     networks:
       - chat-net
 
-  # Segundo nó servidor provendo concorrência/alta disponibilidade via Router/Dealer do Broker
   server-2:
     build:
       context: .
@@ -37,15 +47,16 @@ services:
     environment:
       - SERVER_ID=server_2
       - BROKER_URL=tcp://broker:5556
+      - PUBSUB_URL=tcp://pubsub-proxy:5557
     command: python server.py
     volumes:
       - server2-data:/app/data
     depends_on:
       - broker
+      - pubsub-proxy
     networks:
       - chat-net
 
-  # Instância Cliente Bot 1 (Java)
   client-1:
     build:
       context: .
@@ -53,14 +64,15 @@ services:
     environment:
       - BOT_NAME=bot_alice
       - BROKER_URL=tcp://broker:5555
+      - PUBSUB_URL=tcp://pubsub-proxy:5558
     depends_on:
       - broker
+      - pubsub-proxy
       - server-1
       - server-2
     networks:
       - chat-net
 
-  # Instância Cliente Bot 2 (Java)
   client-2:
     build:
       context: .
@@ -68,19 +80,19 @@ services:
     environment:
       - BOT_NAME=bot_bob
       - BROKER_URL=tcp://broker:5555
+      - PUBSUB_URL=tcp://pubsub-proxy:5558
     depends_on:
       - broker
+      - pubsub-proxy
       - server-1
       - server-2
     networks:
       - chat-net
 
-# Uma rede em formato Bridge exclusiva para as aplicações se comunicarem via TCP ZeroMQ
 networks:
   chat-net:
     driver: bridge
 
-# Definição e isolamento estrutural dos dados, garantindo separação conforme exigido para persistência independente
 volumes:
   server1-data:
   server2-data:

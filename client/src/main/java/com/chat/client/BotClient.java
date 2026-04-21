@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.msgpack.jackson.dataformat.MessagePackFactory;
 
 import java.util.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class BotClient {
 
@@ -15,6 +16,22 @@ public class BotClient {
     static ZContext context;
     static String botName;
     static String brokerUrl;
+
+    static AtomicLong lamportClock = new AtomicLong(0);
+
+    static long lamportSend() {
+        return lamportClock.incrementAndGet();
+    }
+
+    static long lamportReceive(long received) {
+        long updated;
+        do {
+            long current = lamportClock.get();
+            updated = Math.max(current, received) + 1;
+        } while (!lamportClock.compareAndSet(lamportClock.get(), updated));
+        return lamportClock.get();
+    }
+
 
     public static void main(String[] args) throws Exception {
         brokerUrl = System.getenv("BROKER_URL") != null ? System.getenv("BROKER_URL") : "tcp://broker:5555";
@@ -100,11 +117,17 @@ public class BotClient {
                 Map<String, Object> msg = mapper.readValue(corpo, Map.class);
                 long tsEnvio = ((Number) msg.get("timestamp")).longValue();
                 long tsRecebido = System.currentTimeMillis();
+                long receivedLC = msg.containsKey("lamport_clock") ? ((Number) msg.get("lamport_clock")).longValue() : 0;
+                long currentLC = lamportReceive(receivedLC);
 
-                System.out.println("[" + botName + "] RECEBIDO | canal=" + msg.get("channel")
+                System.out.println("[" + botName + "] RECEBIDO"
+                    + " | canal=" + msg.get("channel")
                     + " | de=" + msg.get("username")
                     + " | msg=" + msg.get("message")
-                    + " | enviado=" + tsEnvio + " | recebido=" + tsRecebido);
+                    + " | LC_recebido=" + receivedLC
+                    + " | LC_atual=" + currentLC
+                    + " | ts_envio=" + tsEnvio
+                    + " | ts_recebido=" + tsRecebido);
             } catch (Exception e) {
                 System.err.println("[" + botName + "] Erro ao receber mensagem: " + e.getMessage());
             }
@@ -113,12 +136,14 @@ public class BotClient {
 
     static boolean fazerLogin() {
         try {
+            long lc = lamportSend();
             Map<String, Object> req = new HashMap<>();
             req.put("type", "LOGIN_REQ");
             req.put("timestamp", System.currentTimeMillis());
+            req.put("lamport_clock", lc);
             req.put("payload", Map.of("username", botName));
 
-            System.out.println("[" + botName + "] --> LOGIN_REQ");
+            System.out.println("[" + botName + "] --> LOGIN_REQ | LC=" + lc);
             reqSocket.send(mapper.writeValueAsBytes(req), 0);
 
             byte[] raw = reqSocket.recv(0);
@@ -129,9 +154,11 @@ public class BotClient {
             }
 
             Map<String, Object> resp = mapper.readValue(raw, Map.class);
+            long respLC = resp.containsKey("lamport_clock") ? ((Number) resp.get("lamport_clock")).longValue() : 0;
+            long currentLC = lamportReceive(respLC);
             Map<String, Object> payload = (Map<String, Object>) resp.get("payload");
-            System.out.println("[" + botName + "] <-- LOGIN_RESP | " + payload.get("message"));
 
+            System.out.println("[" + botName + "] <-- LOGIN_RESP | LC=" + currentLC + " | " + payload.get("message"));
             return "SUCCESS".equals(payload.get("status"));
         } catch (Exception e) {
             System.err.println("[" + botName + "] Erro no login: " + e.getMessage());
@@ -142,9 +169,11 @@ public class BotClient {
 
     static List<String> listarCanais() {
         try {
+            long lc = lamportSend();
             Map<String, Object> req = new HashMap<>();
             req.put("type", "LIST_CHANNELS_REQ");
             req.put("timestamp", System.currentTimeMillis());
+            req.put("lamport_clock", lc);
             req.put("payload", new HashMap<>());
 
             reqSocket.send(mapper.writeValueAsBytes(req), 0);
@@ -152,9 +181,12 @@ public class BotClient {
             if (raw == null) return new ArrayList<>();
 
             Map<String, Object> resp = mapper.readValue(raw, Map.class);
+            long respLC = resp.containsKey("lamport_clock") ? ((Number) resp.get("lamport_clock")).longValue() : 0;
+            long currentLC = lamportReceive(respLC);
             Map<String, Object> payload = (Map<String, Object>) resp.get("payload");
             List<String> canais = (List<String>) payload.get("channels");
-            System.out.println("[" + botName + "] <-- LIST_CHANNELS_RESP | canais=" + canais);
+
+            System.out.println("[" + botName + "] <-- LIST_CHANNELS_RESP | LC=" + currentLC + " | canais=" + canais);
             return canais != null ? canais : new ArrayList<>();
         } catch (Exception e) {
             System.err.println("[" + botName + "] Erro ao listar canais: " + e.getMessage());
@@ -164,20 +196,25 @@ public class BotClient {
 
     static void criarCanal(String nome) {
         try {
+            long lc = lamportSend();
             Map<String, Object> req = new HashMap<>();
             req.put("type", "CREATE_CHANNEL_REQ");
             req.put("timestamp", System.currentTimeMillis());
+            req.put("lamport_clock", lc);
             req.put("payload", Map.of("channel_name", nome));
 
-            System.out.println("[" + botName + "] --> CREATE_CHANNEL_REQ | canal=" + nome);
+            System.out.println("[" + botName + "] --> CREATE_CHANNEL_REQ | LC=" + lc + " | canal=" + nome);
             reqSocket.send(mapper.writeValueAsBytes(req), 0);
 
             byte[] raw = reqSocket.recv(0);
             if (raw == null) return;
 
             Map<String, Object> resp = mapper.readValue(raw, Map.class);
+            long respLC = resp.containsKey("lamport_clock") ? ((Number) resp.get("lamport_clock")).longValue() : 0;
+            long currentLC = lamportReceive(respLC);
             Map<String, Object> payload = (Map<String, Object>) resp.get("payload");
-            System.out.println("[" + botName + "] <-- CREATE_CHANNEL_RESP | " + payload.get("message"));
+
+            System.out.println("[" + botName + "] <-- CREATE_CHANNEL_RESP | LC=" + currentLC + " | " + payload.get("message"));
         } catch (Exception e) {
             System.err.println("[" + botName + "] Erro ao criar canal: " + e.getMessage());
         }
@@ -185,6 +222,7 @@ public class BotClient {
 
     static void publicarMensagem(String canal, String mensagem) {
         try {
+            long lc = lamportSend();
             Map<String, Object> payload = new HashMap<>();
             payload.put("channel", canal);
             payload.put("username", botName);
@@ -193,17 +231,21 @@ public class BotClient {
             Map<String, Object> req = new HashMap<>();
             req.put("type", "PUBLISH_REQ");
             req.put("timestamp", System.currentTimeMillis());
+            req.put("lamport_clock", lc);
             req.put("payload", payload);
 
-            System.out.println("[" + botName + "] --> PUBLISH_REQ | canal=" + canal + " | msg=" + mensagem);
+            System.out.println("[" + botName + "] --> PUBLISH_REQ | LC=" + lc + " | canal=" + canal + " | msg=" + mensagem);
             reqSocket.send(mapper.writeValueAsBytes(req), 0);
 
             byte[] raw = reqSocket.recv(0);
             if (raw == null) return;
 
             Map<String, Object> resp = mapper.readValue(raw, Map.class);
+            long respLC = resp.containsKey("lamport_clock") ? ((Number) resp.get("lamport_clock")).longValue() : 0;
+            long currentLC = lamportReceive(respLC);
             Map<String, Object> respPayload = (Map<String, Object>) resp.get("payload");
-            System.out.println("[" + botName + "] <-- PUBLISH_RESP | " + respPayload.get("message"));
+
+            System.out.println("[" + botName + "] <-- PUBLISH_RESP | LC=" + currentLC + " | " + respPayload.get("message"));
         } catch (Exception e) {
             System.err.println("[" + botName + "] Erro ao publicar: " + e.getMessage());
         }

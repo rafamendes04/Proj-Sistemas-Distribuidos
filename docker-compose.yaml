@@ -1,6 +1,16 @@
 version: '3.8'
 
 services:
+  reference:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    command: python reference.py
+    networks:
+      - chat-net
+    ports:
+      - "5560:5560"
+
   broker:
     build:
       context: .
@@ -31,12 +41,14 @@ services:
       - SERVER_ID=server_1
       - BROKER_URL=tcp://broker:5556
       - PUBSUB_URL=tcp://pubsub-proxy:5557
+      - REFERENCE_URL=tcp://reference:5560
     command: python server.py
     volumes:
       - server1-data:/app/data
     depends_on:
       - broker
       - pubsub-proxy
+      - reference
     networks:
       - chat-net
 
@@ -48,12 +60,14 @@ services:
       - SERVER_ID=server_2
       - BROKER_URL=tcp://broker:5556
       - PUBSUB_URL=tcp://pubsub-proxy:5557
+      - REFERENCE_URL=tcp://reference:5560
     command: python server.py
     volumes:
       - server2-data:/app/data
     depends_on:
       - broker
       - pubsub-proxy
+      - reference
     networks:
       - chat-net
 

@@ -20,7 +20,6 @@ def main():
     
     print("[Broker] ✅ Iniciado. Roteando tráfego entre Clientes (5555) e Servidores (5556)...")
     try:
-        # zmq.proxy bloqueia e gerencia de forma transparente a passagem de mensagens entre os dois sockets
         zmq.proxy(frontend, backend)
     except KeyboardInterrupt:
         pass

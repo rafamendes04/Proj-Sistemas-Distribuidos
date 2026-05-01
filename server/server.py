@@ -141,9 +141,10 @@ def get_peers(server_id):
     return peers
 
 
-def pedir_hora(context, host, port, server_id):
-    s = context.socket(zmq.REQ)
-    s.setsockopt(zmq.RCVTIMEO, 3000)
+def pedir_hora(host, port, server_id):
+    ctx = zmq.Context()
+    s = ctx.socket(zmq.REQ)
+    s.setsockopt(zmq.RCVTIMEO, 5000)
     s.setsockopt(zmq.LINGER, 0)
     try:
         s.connect(f"tcp://{host}:{port}")
@@ -157,7 +158,7 @@ def pedir_hora(context, host, port, server_id):
         s.close()
 
 
-def sincronizar(context, server_id, peers):
+def sincronizar(server_id, peers):
     global lamport_clock
 
     with coordinator_lock:
@@ -174,12 +175,12 @@ def sincronizar(context, server_id, peers):
     info = next((p for p in peers if p["name"] == coord), None)
     if info is None:
         print(f"[{server_id}] Coordenador '{coord}' sumiu, iniciando eleicao.")
-        iniciar_eleicao(context, server_id, peers)
+        iniciar_eleicao(server_id, peers)
         return
 
-    coord_time = pedir_hora(context, info["host"], info["port"], server_id)
+    coord_time = pedir_hora(info["host"], info["port"], server_id)
     if coord_time is None:
-        iniciar_eleicao(context, server_id, peers)
+        iniciar_eleicao(server_id, peers)
         return
 
     local_time = int(time.time() * 1000)
@@ -190,15 +191,16 @@ def sincronizar(context, server_id, peers):
         lamport_clock = max(lamport_clock, coord_time // 1000)
 
 
-def iniciar_eleicao(context, server_id, peers):
+def iniciar_eleicao(server_id, peers):
     print(f"[{server_id}] Iniciando eleicao...")
 
     maiores = [p for p in peers if p["name"] > server_id]
     algum_vivo = False
 
     for peer in maiores:
-        s = context.socket(zmq.REQ)
-        s.setsockopt(zmq.RCVTIMEO, 3000)
+        ctx = zmq.Context()
+        s = ctx.socket(zmq.REQ)
+        s.setsockopt(zmq.RCVTIMEO, 5000)
         s.setsockopt(zmq.LINGER, 0)
         try:
             s.connect(f"tcp://{peer['host']}:{peer['port']}")
@@ -214,10 +216,10 @@ def iniciar_eleicao(context, server_id, peers):
             s.close()
 
     if not algum_vivo:
-        virar_coordenador(context, server_id)
+        virar_coordenador(server_id, os.getenv("PUBSUB_URL", "tcp://pubsub-proxy:5557"))
 
 
-def virar_coordenador(context, server_id):
+def virar_coordenador(server_id, pubsub_url):
     global coordinator
 
     with coordinator_lock:
@@ -225,18 +227,20 @@ def virar_coordenador(context, server_id):
 
     print(f"[{server_id}] Sou o novo coordenador!")
 
-    pub = context.socket(zmq.PUB)
-    pub.connect(os.getenv("PUBSUB_URL", "tcp://pubsub-proxy:5557"))
+    ctx = zmq.Context()
+    pub = ctx.socket(zmq.PUB)
+    pub.connect(pubsub_url)
     time.sleep(0.2)
     pub.send_multipart([b"servers", msgpack.packb({"coordinator": server_id}, use_bin_type=True)])
     print(f"[{server_id}] --> PUB [servers] coordenador={server_id}")
     pub.close()
 
 
-def election_loop(context, server_id, port, peers):
+def election_loop(server_id, port, peers):
     global coordinator
 
-    s = context.socket(zmq.REP)
+    ctx = zmq.Context()
+    s = ctx.socket(zmq.REP)
     s.bind(f"tcp://*:{port}")
     print(f"[{server_id}] Eleicao escutando na porta {port}")
 
@@ -254,7 +258,7 @@ def election_loop(context, server_id, port, peers):
                 sender = msg.get("from", "?")
                 s.send(msgpack.packb({"status": "OK"}, use_bin_type=True))
                 print(f"[{server_id}] Eleicao recebida de '{sender}'")
-                threading.Thread(target=iniciar_eleicao, args=(context, server_id, peers), daemon=True).start()
+                threading.Thread(target=iniciar_eleicao, args=(server_id, peers), daemon=True).start()
 
             elif action == "new_coordinator":
                 novo = msg.get("coordinator", "")
@@ -274,10 +278,11 @@ def election_loop(context, server_id, port, peers):
                 pass
 
 
-def servers_subscriber(context, server_id):
+def servers_subscriber(server_id):
     global coordinator
 
-    sub = context.socket(zmq.SUB)
+    ctx = zmq.Context()
+    sub = ctx.socket(zmq.SUB)
     sub.connect(os.getenv("PUBSUB_URL_SUB", "tcp://pubsub-proxy:5558"))
     sub.setsockopt_string(zmq.SUBSCRIBE, "servers")
 
@@ -316,8 +321,8 @@ def main():
     time.sleep(1)
     rank, ref_socket = registrar_referencia(context, ref_url, server_id)
 
-    threading.Thread(target=election_loop, args=(context, server_id, election_port, peers), daemon=True).start()
-    threading.Thread(target=servers_subscriber, args=(context, server_id), daemon=True).start()
+    threading.Thread(target=election_loop, args=(server_id, election_port, peers), daemon=True).start()
+    threading.Thread(target=servers_subscriber, args=(server_id,), daemon=True).start()
 
     # o servidor com nome maior vira coordenador direto no inicio
     # eleicao so acontece quando o coordenador atual cair
@@ -327,8 +332,8 @@ def main():
         coordinator = coordenador_inicial
     if server_id == coordenador_inicial:
         def anunciar():
-            time.sleep(2)
-            virar_coordenador(context, server_id)
+            time.sleep(0.5)
+            virar_coordenador(server_id, os.getenv("PUBSUB_URL", "tcp://pubsub-proxy:5557"))
         threading.Thread(target=anunciar, daemon=True).start()
 
     print(f"[{server_id}] Pronto. Rank={rank}")
@@ -382,7 +387,7 @@ def main():
             if msgs >= 15:
                 msgs = 0
                 ref_socket = heartbeat(context, ref_socket, ref_url, server_id)
-                sincronizar(context, server_id, peers)
+                sincronizar(server_id, peers)
 
         except Exception as e:
             print(f"[{server_id}] Erro: {e}")

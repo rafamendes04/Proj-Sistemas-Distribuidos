@@ -3,13 +3,16 @@ import time
 import msgpack
 import threading
 
+# Dicionário global para armazenar informações dos servidores
 servers = {}
 rank_counter = 0
 lock = threading.Lock()
 
+# Tempo limite para considerar um servidor inativo (em segundos)
 HEARTBEAT_TIMEOUT = 60
 
 def cleanup_loop():
+    """Loop que remove servidores que não enviaram heartbeat recentemente."""
     while True:
         time.sleep(10)
         now = time.time()
@@ -28,6 +31,7 @@ def main():
     socket.bind("tcp://*:5560")
     print("[Reference] Iniciado na porta 5560.")
 
+    # Inicia a thread de limpeza em segundo plano
     threading.Thread(target=cleanup_loop, daemon=True).start()
 
     while True:
@@ -68,7 +72,7 @@ def main():
                     else:
                         print(f"[Reference] Heartbeat de '{name}' desconhecido.")
 
-                # current_time removido conforme requisito da Entrega 4
+                # Requisito da Entrega 4: Responde apenas com status OK, sem a hora
                 socket.send(msgpack.packb({"status": "OK"}, use_bin_type=True))
 
             else:

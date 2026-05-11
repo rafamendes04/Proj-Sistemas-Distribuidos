@@ -23,15 +23,16 @@ public class BotClient {
         return lamportClock.incrementAndGet();
     }
 
+    // CAS corrigido: loop garante atomicidade sem race condition
     static long lamportReceive(long received) {
-        long updated;
-        do {
+        while (true) {
             long current = lamportClock.get();
-            updated = Math.max(current, received) + 1;
-        } while (!lamportClock.compareAndSet(lamportClock.get(), updated));
-        return lamportClock.get();
+            long updated = Math.max(current, received) + 1;
+            if (lamportClock.compareAndSet(current, updated)) {
+                return updated;
+            }
+        }
     }
-
 
     public static void main(String[] args) throws Exception {
         brokerUrl = System.getenv("BROKER_URL") != null ? System.getenv("BROKER_URL") : "tcp://broker:5555";
@@ -65,11 +66,9 @@ public class BotClient {
         Collections.shuffle(disponiveis);
         for (String canal : disponiveis) {
             if (inscrito.size() >= 3) break;
-            if (!inscrito.contains(canal)) {
-                subSocket.subscribe(canal.getBytes());
-                inscrito.add(canal);
-                System.out.println("[" + botName + "] Inscrito em: " + canal);
-            }
+            subSocket.subscribe(canal.getBytes());
+            inscrito.add(canal);
+            System.out.println("[" + botName + "] Inscrito em: " + canal);
         }
 
         Thread listener = new Thread(() -> escutarMensagens(subSocket));

@@ -8,15 +8,12 @@ import sys
 
 sys.stdout.reconfigure(line_buffering=True)
 
-# Relógios
 lamport_clock = 0
 lamport_lock = threading.Lock()
-clock_offset = 0  # Para o Algoritmo de Berkeley (ajuste do relógio físico)
-
+clock_offset = 0
 coordinator = None
 coordinator_lock = threading.Lock()
 
-# Contexto global para evitar vazamento de memória/recursos
 context = zmq.Context()
 
 def get_current_time_ms():
@@ -45,7 +42,6 @@ def init_db(path):
     conn.commit()
     return conn
 
-# --- Handlers de Mensagens (Mantidos conforme original) ---
 def handle_login(conn, payload):
     ts = get_current_time_ms()
     try:
@@ -95,24 +91,15 @@ def handle_publish(conn, pub_socket, server_id, payload, clock):
     }, use_bin_type=True)])
     return "SUCCESS", "Mensagem publicada."
 
-# --- Lógica de Sincronização e Eleição ---
-
-def novo_ref_socket(ref_url):
-    s = context.socket(zmq.REQ)
-    s.setsockopt(zmq.RCVTIMEO, 2000)
-    s.setsockopt(zmq.LINGER, 0)
-    s.connect(ref_url)
-    return s
+def peer_host(name):
+    return name.replace("_", "-")
 
 def pedir_hora(host, port, server_id):
-    # Usa o contexto global
     s = context.socket(zmq.REQ)
     s.setsockopt(zmq.RCVTIMEO, 2000)
     s.setsockopt(zmq.LINGER, 0)
-    # IMPORTANTE: Corrige o nome do host para o Docker (troca _ por - se necessário)
-    docker_host = host.replace("_", "-")
     try:
-        s.connect(f"tcp://{docker_host}:{port}")
+        s.connect(f"tcp://{peer_host(host)}:{port}")
         s.send(msgpack.packb({"action": "get_time", "name": server_id}, use_bin_type=True))
         resp = msgpack.unpackb(s.recv(), raw=False)
         return resp.get("current_time")
@@ -131,61 +118,66 @@ def sincronizar(server_id, peers):
 
     info = next((p for p in peers if p["name"] == coord), None)
     if not info:
-        iniciar_eleicao(server_id, peers)
+        print(f"[{server_id}] Coordenador '{coord}' nao esta na lista de peers, iniciando eleicao.")
+        threading.Thread(target=iniciar_eleicao, args=(server_id, peers), daemon=True).start()
         return
 
+    t_antes = int(time.time() * 1000)
     coord_time = pedir_hora(info["host"], info["port"], server_id)
+    t_depois = int(time.time() * 1000)
+
     if coord_time is None:
-        print(f"[{server_id}] Coordenador inativo, iniciando eleicao.")
-        iniciar_eleicao(server_id, peers)
-    else:
-        local_now = int(time.time() * 1000)
-        # Berkeley Simplificado: Ajusta a diferença para bater com o coordenador
-        new_offset = coord_time - local_now
-        clock_offset = new_offset
-        print(f"[{server_id}] Relogio Sincronizado. Offset: {clock_offset}ms")
+        print(f"[{server_id}] [Berkeley] Coordenador '{coord}' nao respondeu. Iniciando eleicao.")
+        threading.Thread(target=iniciar_eleicao, args=(server_id, peers), daemon=True).start()
+        return
+
+    rtt = t_depois - t_antes
+    local_now = t_antes + rtt // 2
+    new_offset = coord_time - local_now
+    clock_offset = new_offset
+    print(f"[{server_id}] [Berkeley] Sincronizado com '{coord}'. Offset={clock_offset}ms RTT={rtt}ms")
 
 def iniciar_eleicao(server_id, peers):
-    print(f"[{server_id}] Iniciando eleicao...")
+    print(f"[{server_id}] [Bully] Iniciando eleicao...")
     maiores = [p for p in peers if p["name"] > server_id]
-    algum_superior_respondeu = False
+    algum_respondeu = False
 
     for peer in maiores:
         s = context.socket(zmq.REQ)
         s.setsockopt(zmq.RCVTIMEO, 2000)
         s.setsockopt(zmq.LINGER, 0)
-        docker_host = peer['host'].replace("_", "-")
         try:
-            s.connect(f"tcp://{docker_host}:{peer['port']}")
+            s.connect(f"tcp://{peer_host(peer['host'])}:{peer['port']}")
             s.send(msgpack.packb({"action": "election", "from": server_id}, use_bin_type=True))
             resp = msgpack.unpackb(s.recv(), raw=False)
             if resp.get("status") == "OK":
-                algum_superior_respondeu = True
+                algum_respondeu = True
+                print(f"[{server_id}] [Bully] Peer '{peer['name']}' respondeu, ele assume.")
                 break
         except:
             continue
         finally:
             s.close()
 
-    if not algum_superior_respondeu:
+    if not algum_respondeu:
         virar_coordenador(server_id)
 
 def virar_coordenador(server_id):
     global coordinator
     with coordinator_lock:
         coordinator = server_id
-    
-    print(f"[{server_id}] Eu sou o novo coordenador!")
+
+    print(f"[{server_id}] [Bully] Sou o novo coordenador!")
     pub = context.socket(zmq.PUB)
     pub.connect(os.getenv("PUBSUB_URL", "tcp://pubsub-proxy:5557"))
-    time.sleep(0.5) # Aguarda "slow joiners" do ZMQ
+    time.sleep(0.5)
     pub.send_multipart([b"servers", msgpack.packb({"coordinator": server_id}, use_bin_type=True)])
     pub.close()
 
 def election_loop(port, server_id, peers):
     s = context.socket(zmq.REP)
     s.bind(f"tcp://*:{port}")
-    
+
     while True:
         try:
             raw = s.recv()
@@ -194,14 +186,15 @@ def election_loop(port, server_id, peers):
 
             if action == "get_time":
                 s.send(msgpack.packb({"current_time": get_current_time_ms()}, use_bin_type=True))
-            
+
             elif action == "election":
                 s.send(msgpack.packb({"status": "OK"}, use_bin_type=True))
                 threading.Thread(target=iniciar_eleicao, args=(server_id, peers), daemon=True).start()
-            
+
             else:
                 s.send(msgpack.packb({"error": "unknown"}, use_bin_type=True))
-        except:
+        except Exception as e:
+            print(f"[{server_id}] election_loop erro: {e}")
             continue
 
 def servers_subscriber(server_id):
@@ -212,16 +205,23 @@ def servers_subscriber(server_id):
 
     while True:
         try:
-            topic = sub.recv()
+            sub.recv()
             data = sub.recv()
             msg = msgpack.unpackb(data, raw=False)
             novo = msg.get("coordinator")
             if novo:
                 with coordinator_lock:
                     coordinator = novo
-                print(f"[{server_id}] Novo coordenador anunciado: {novo}")
+                print(f"[{server_id}] [Bully] Novo coordenador via PubSub: {novo}")
         except:
             continue
+
+def novo_ref_socket(ref_url):
+    s = context.socket(zmq.REQ)
+    s.setsockopt(zmq.RCVTIMEO, 2000)
+    s.setsockopt(zmq.LINGER, 0)
+    s.connect(ref_url)
+    return s
 
 def main():
     server_id = os.getenv("SERVER_ID", "server_1")
@@ -229,55 +229,54 @@ def main():
     conn = init_db(f"/app/data/{server_id}.db")
 
     election_port = os.getenv("ELECTION_PORT", "5570")
-    
-    # Processa peers e garante nomes limpos
+
     raw_peers = os.getenv("PEERS", "").split(",")
     peers = []
     for p in raw_peers:
         if ":" in p:
             name, port = p.split(":")
+            name = name.strip()
             if name != server_id:
-                peers.append({"name": name, "port": port, "host": name})
+                peers.append({"name": name, "port": port.strip(), "host": name})
 
-    # Sockets principais
     rep = context.socket(zmq.REP)
     rep.connect(os.getenv("BROKER_URL", "tcp://broker:5556"))
+
     pub = context.socket(zmq.PUB)
     pub.connect(os.getenv("PUBSUB_URL", "tcp://pubsub-proxy:5557"))
 
-    # Threads de suporte
     threading.Thread(target=election_loop, args=(election_port, server_id, peers), daemon=True).start()
     threading.Thread(target=servers_subscriber, args=(server_id,), daemon=True).start()
 
-    # Registro inicial
     ref_url = os.getenv("REFERENCE_URL", "tcp://reference:5560")
     ref_socket = novo_ref_socket(ref_url)
     try:
         ref_socket.send(msgpack.packb({"action": "register", "name": server_id}, use_bin_type=True))
         ref_socket.recv()
-    except:
-        pass
+        print(f"[{server_id}] Registrado no servico de referencia.")
+    except Exception as e:
+        print(f"[{server_id}] Falha ao registrar na referencia: {e}")
 
-    # No início, o de maior ID assume
     todos = [p["name"] for p in peers] + [server_id]
     if server_id == max(todos):
         time.sleep(1)
         virar_coordenador(server_id)
 
-    print(f"[{server_id}] Online.")
-    
+    print(f"[{server_id}] Online. Porta de eleicao: {election_port}")
+
     msg_count = 0
     while True:
         try:
             raw = rep.recv()
             msg = msgpack.unpackb(raw, raw=False)
             msg_type = msg.get("type", "")
-            
-            # Sincronia Lamport (Lógica)
+
             lc = lamport_receive(msg.get("lamport_clock", 0))
-            
+
+            print(f"[{server_id}] RECEBIDO | tipo={msg_type} | LC={lc}")
+
             resp = {"timestamp": get_current_time_ms()}
-            
+
             if msg_type == "LOGIN_REQ":
                 s, t = handle_login(conn, msg['payload'])
                 resp.update({"type": "LOGIN_RESP", "payload": {"status": s, "message": t}})
@@ -290,25 +289,25 @@ def main():
             elif msg_type == "CREATE_CHANNEL_REQ":
                 s, t = handle_create_channel(conn, msg['payload'])
                 resp.update({"type": "CREATE_CHANNEL_RESP", "payload": {"status": s, "message": t}})
+            else:
+                resp.update({"type": "ERROR_RESP", "payload": {"status": "ERROR", "message": "Tipo desconhecido"}})
 
             resp["lamport_clock"] = lamport_send()
             rep.send(msgpack.packb(resp, use_bin_type=True))
 
-            # Regra das 15 mensagens
             msg_count += 1
             if msg_count >= 15:
                 msg_count = 0
-                # Heartbeat
                 try:
                     ref_socket.send(msgpack.packb({"action": "heartbeat", "name": server_id}, use_bin_type=True))
                     ref_socket.recv()
                 except:
                     ref_socket = novo_ref_socket(ref_url)
-                # Sincronia de Relógio
-                sincronizar(server_id, peers)
+                # Thread separada pra nao travar o loop principal durante a sincronizacao
+                threading.Thread(target=sincronizar, args=(server_id, peers), daemon=True).start()
 
         except Exception as e:
-            print(f"Erro no loop principal: {e}")
+            print(f"[{server_id}] Erro no loop principal: {e}")
 
 if __name__ == "__main__":
     main()

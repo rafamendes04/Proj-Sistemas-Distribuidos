@@ -51,11 +51,19 @@ def handle_login(conn, payload):
     except Exception as e:
         return "ERROR", str(e)
 
-def handle_create_channel(conn, payload):
+def handle_create_channel(conn, payload, peers_push=None, server_id=None):
     ts = get_current_time_ms()
     try:
         conn.execute("INSERT INTO channels (channel_name, created_at) VALUES (?, ?)", (payload['channel_name'], ts))
         conn.commit()
+
+        if peers_push:
+            replicar(peers_push, server_id, {
+                "action": "replicate_channel",
+                "channel_name": payload['channel_name'],
+                "created_at": ts
+            })
+
         return "SUCCESS", f"Channel '{payload['channel_name']}' created."
     except sqlite3.IntegrityError:
         return "ERROR", f"Channel '{payload['channel_name']}' already exists."
@@ -66,7 +74,7 @@ def handle_list_channels(conn):
     rows = conn.execute("SELECT channel_name FROM channels").fetchall()
     return "SUCCESS", [r[0] for r in rows]
 
-def handle_publish(conn, pub_socket, server_id, payload, clock):
+def handle_publish(conn, pub_socket, server_id, payload, clock, peers_push=None):
     channel = payload.get('channel', '')
     username = payload.get('username', '')
     content = payload.get('message', '')
@@ -89,7 +97,63 @@ def handle_publish(conn, pub_socket, server_id, payload, clock):
         "channel": channel, "username": username,
         "message": content, "timestamp": ts, "lamport_clock": lc
     }, use_bin_type=True)])
+
+    if peers_push:
+        replicar(peers_push, server_id, {
+            "action": "replicate_message",
+            "channel": channel,
+            "username": username,
+            "content": content,
+            "timestamp": ts,
+            "lamport_clock": lc
+        })
+
     return "SUCCESS", "Mensagem publicada."
+
+def replicar(peers_push, server_id, data):
+    data["origin"] = server_id
+    packed = msgpack.packb(data, use_bin_type=True)
+    for sock in peers_push:
+        try:
+            sock.send(packed, zmq.NOBLOCK)
+        except Exception as e:
+            print(f"[{server_id}] [Replicacao] Erro ao enviar para peer: {e}")
+
+def replication_receiver(port, conn, server_id):
+    s = context.socket(zmq.PULL)
+    s.bind(f"tcp://*:{port}")
+    print(f"[{server_id}] [Replicacao] Escutando na porta {port}")
+
+    while True:
+        try:
+            raw = s.recv()
+            msg = msgpack.unpackb(raw, raw=False)
+            action = msg.get("action", "")
+
+            if action == "replicate_message":
+                try:
+                    conn.execute(
+                        "INSERT INTO messages (channel, username, content, timestamp, lamport_clock) VALUES (?, ?, ?, ?, ?)",
+                        (msg["channel"], msg["username"], msg["content"], msg["timestamp"], msg["lamport_clock"])
+                    )
+                    conn.commit()
+                    print(f"[{server_id}] [Replicacao] Mensagem replicada | canal={msg['channel']} | de={msg['username']} | origin={msg.get('origin')}")
+                except Exception as e:
+                    print(f"[{server_id}] [Replicacao] Erro ao gravar mensagem: {e}")
+
+            elif action == "replicate_channel":
+                try:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO channels (channel_name, created_at) VALUES (?, ?)",
+                        (msg["channel_name"], msg["created_at"])
+                    )
+                    conn.commit()
+                    print(f"[{server_id}] [Replicacao] Canal replicado | canal={msg['channel_name']} | origin={msg.get('origin')}")
+                except Exception as e:
+                    print(f"[{server_id}] [Replicacao] Erro ao gravar canal: {e}")
+
+        except Exception as e:
+            print(f"[{server_id}] [Replicacao] Erro no receiver: {e}")
 
 def peer_host(name):
     return name.replace("_", "-")
@@ -229,6 +293,7 @@ def main():
     conn = init_db(f"/app/data/{server_id}.db")
 
     election_port = os.getenv("ELECTION_PORT", "5570")
+    replication_port = os.getenv("REPLICATION_PORT", "5580")
 
     raw_peers = os.getenv("PEERS", "").split(",")
     peers = []
@@ -239,6 +304,22 @@ def main():
             if name != server_id:
                 peers.append({"name": name, "port": port.strip(), "host": name})
 
+    # Sockets PUSH para enviar replicacao aos outros servidores
+    raw_rep_peers = os.getenv("REPLICATION_PEERS", "").split(",")
+    peers_push = []
+    for entry in raw_rep_peers:
+        entry = entry.strip()
+        if ":" in entry:
+            host, port = entry.split(":")
+            host = host.strip()
+            if host != server_id:
+                s = context.socket(zmq.PUSH)
+                s.setsockopt(zmq.LINGER, 0)
+                s.setsockopt(zmq.SNDHWM, 100)
+                s.connect(f"tcp://{peer_host(host)}:{port.strip()}")
+                peers_push.append(s)
+                print(f"[{server_id}] [Replicacao] Conectado ao peer {host}:{port.strip()}")
+
     rep = context.socket(zmq.REP)
     rep.connect(os.getenv("BROKER_URL", "tcp://broker:5556"))
 
@@ -247,6 +328,7 @@ def main():
 
     threading.Thread(target=election_loop, args=(election_port, server_id, peers), daemon=True).start()
     threading.Thread(target=servers_subscriber, args=(server_id,), daemon=True).start()
+    threading.Thread(target=replication_receiver, args=(replication_port, conn, server_id), daemon=True).start()
 
     ref_url = os.getenv("REFERENCE_URL", "tcp://reference:5560")
     ref_socket = novo_ref_socket(ref_url)
@@ -262,7 +344,7 @@ def main():
         time.sleep(1)
         virar_coordenador(server_id)
 
-    print(f"[{server_id}] Online. Porta de eleicao: {election_port}")
+    print(f"[{server_id}] Online. Porta de eleicao: {election_port} | Porta de replicacao: {replication_port}")
 
     msg_count = 0
     while True:
@@ -281,13 +363,13 @@ def main():
                 s, t = handle_login(conn, msg['payload'])
                 resp.update({"type": "LOGIN_RESP", "payload": {"status": s, "message": t}})
             elif msg_type == "PUBLISH_REQ":
-                s, t = handle_publish(conn, pub, server_id, msg['payload'], lc)
+                s, t = handle_publish(conn, pub, server_id, msg['payload'], lc, peers_push=peers_push)
                 resp.update({"type": "PUBLISH_RESP", "payload": {"status": s, "message": t}})
             elif msg_type == "LIST_CHANNELS_REQ":
                 s, c = handle_list_channels(conn)
                 resp.update({"type": "LIST_CHANNELS_RESP", "payload": {"status": s, "channels": c}})
             elif msg_type == "CREATE_CHANNEL_REQ":
-                s, t = handle_create_channel(conn, msg['payload'])
+                s, t = handle_create_channel(conn, msg['payload'], peers_push=peers_push, server_id=server_id)
                 resp.update({"type": "CREATE_CHANNEL_RESP", "payload": {"status": s, "message": t}})
             else:
                 resp.update({"type": "ERROR_RESP", "payload": {"status": "ERROR", "message": "Tipo desconhecido"}})
@@ -303,7 +385,6 @@ def main():
                     ref_socket.recv()
                 except:
                     ref_socket = novo_ref_socket(ref_url)
-                # Thread separada pra nao travar o loop principal durante a sincronizacao
                 threading.Thread(target=sincronizar, args=(server_id, peers), daemon=True).start()
 
         except Exception as e:
